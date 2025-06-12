@@ -34,3 +34,13 @@ Create a `.env` file: MONGODB_URI="mongodb+srv://firdaussulaiman:122868Murni@clu
 ```bash
 npm install
 npm run dev
+ext Stage (Coming Up): Microsoft Entra ID Auth
+sql
+Copy
+Edit
+
+Then push it:
+```bash
+git add README.md
+git commit -m "📝 Add project README for Stage 1"
+git push
