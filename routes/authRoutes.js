@@ -1,20 +1,38 @@
-
-// ===========================
-// 📁 File: backend/routes/authRoutes.js
-// ===========================
-
 const express = require('express');
-const axios = require('axios');
-const jwt = require('jsonwebtoken');
-const User = require('../models/User');
-const router = express.Router();
+const axios   = require('axios');
+const jwt     = require('jsonwebtoken');
+const User    = require('../models/User');
 require('dotenv').config();
 
-// 🔐 Microsoft Login Handler
+const router = express.Router();
+
+// Helpers to sign our JWTs
+function generateAccessToken(user) {
+  return jwt.sign(
+    {
+      userId: user._id,
+      email: user.email,
+      displayName: user.displayName,
+      role: user.role
+    },
+    process.env.JWT_SECRET,
+    { expiresIn: '15m' }
+  );
+}
+
+function generateRefreshToken(user) {
+  return jwt.sign(
+    { userId: user._id },
+    process.env.REFRESH_TOKEN_SECRET,
+    { expiresIn: '7d' }
+  );
+}
+
+// POST /api/auth/login
 router.post('/login', async (req, res) => {
   const { code, redirectUri } = req.body;
-
   try {
+    // 1) Exchange code for Microsoft tokens
     const tokenRes = await axios.post(
       `https://login.microsoftonline.com/${process.env.TENANT_ID}/oauth2/v2.0/token`,
       new URLSearchParams({
@@ -23,48 +41,73 @@ router.post('/login', async (req, res) => {
         code,
         grant_type: 'authorization_code',
         redirect_uri: redirectUri,
-        scope: 'https://graph.microsoft.com/User.Read',
+        scope: 'openid profile https://graph.microsoft.com/User.Read'
       }),
       { headers: { 'Content-Type': 'application/x-www-form-urlencoded' } }
     );
+    const msAccessToken = tokenRes.data.access_token;
 
-    const accessToken = tokenRes.data.access_token;
-
+    // 2) Fetch MS user info
     const userRes = await axios.get('https://graph.microsoft.com/v1.0/me', {
-      headers: { Authorization: `Bearer ${accessToken}` },
+      headers: { Authorization: `Bearer ${msAccessToken}` }
     });
+    const msUser = userRes.data;
 
-    const profile = userRes.data;
-
-    let user = await User.findOne({ microsoftId: profile.id });
-
+    // 3) Upsert into our DB
+    let user = await User.findOne({ microsoftId: msUser.id });
     if (!user) {
       user = new User({
-        microsoftId: profile.id,
-        displayName: profile.displayName,
-        email: profile.mail || profile.userPrincipalName,
-        givenName: profile.givenName,
-        surname: profile.surname,
-        preferredLanguage: profile.preferredLanguage,
-        jobTitle: profile.jobTitle,
+        microsoftId: msUser.id,
+        displayName: msUser.displayName,
+        email: msUser.mail || msUser.userPrincipalName,
+        givenName: msUser.givenName,
+        surname: msUser.surname,
+        role: 'user',
+        refreshTokens: []
       });
-      await user.save();
+    } else {
+      // keep info up to date
+      user.displayName = msUser.displayName;
+      user.email       = msUser.mail || msUser.userPrincipalName;
+      user.givenName   = msUser.givenName;
+      user.surname     = msUser.surname;
     }
 
-    const token = jwt.sign(
-      {
-        userId: user._id,
-        email: user.email,
-        displayName: user.displayName,
-      },
-      process.env.JWT_SECRET,
-      { expiresIn: '7d' }
-    );
+    // 4) Generate our tokens
+    const accessToken  = generateAccessToken(user);
+    const refreshToken = generateRefreshToken(user);
+    user.refreshTokens.push(refreshToken);
+    await user.save();
 
-    res.json({ token, user });
+    // 5) Send refreshToken in HttpOnly cookie, scoped to /refresh
+    res.cookie('jid', refreshToken, {
+      httpOnly: true,
+      path: '/api/auth/refresh'
+    });
+
+    // 6) Return accessToken + user info
+    res.json({ accessToken, user });
   } catch (err) {
-    console.error('❌ OAuth Error:', err.response?.data || err.message);
+    console.error('OAuth login failed:', err.response?.data || err.message);
     res.status(400).json({ error: 'OAuth login failed' });
+  }
+});
+
+// POST /api/auth/refresh
+router.post('/refresh', async (req, res) => {
+  const token = req.cookies.jid;
+  if (!token) return res.status(401).json({ error: 'No refresh token' });
+  try {
+    const payload = jwt.verify(token, process.env.REFRESH_TOKEN_SECRET);
+    const user    = await User.findById(payload.userId);
+    if (!user || !user.refreshTokens.includes(token)) {
+      return res.status(403).json({ error: 'Invalid refresh token' });
+    }
+    const newAccessToken = generateAccessToken(user);
+    res.json({ accessToken: newAccessToken });
+  } catch (e) {
+    console.error('Refresh failed:', e.message);
+    res.status(403).json({ error: 'Invalid or expired refresh token' });
   }
 });
 
